@@ -14,6 +14,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import org.tensorflow.lite.Interpreter
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -24,18 +25,14 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * 口袋毛孩 · Android 原生桥接（高画质终极版 v1.1.1）
+ * 口袋毛孩 · Android 原生桥接（v1.1.2 诊断版）
  *
- * 抠图引擎：TensorFlow Lite + U2-Net 全量版（84MB，320×320 输入，7 路侧输出）
- * - 完全离线，无 Google 服务依赖，华为无 GMS 手机直接运行
- *
- * 【v1.1.1 修复】编译错误：cutout PNG 变量名统一为 file（v1.1.0 误引用 outfile）
- * 【v1.1.0 高画质管线】
- * 1. 全量版 U2-Net 替换轻量版（主体完整度、边缘判断显著提升）
- * 2. 贴片推理（2×2 带重叠滑窗）：有效分辨率翻倍，胡须/毛发以接近原生尺度进入模型
- * 3. 百分位归一化（2%~98%）替代 min-max 拉伸：杀掉背景灰雾与地砖阴影的放大效应
- * 4. S 曲线软阈值 + 三次盒模糊羽化：核心更实、边缘更透、过渡自然
- * 5. 7 路侧输出可通过 maskSource 参数实时切换对比（App 内 d1~d7 调试芯片）
+ * 【v1.1.2 变更】
+ * 1. 全管线分阶段自报家门：模型加载 / 读取图片 / AI推理 / 合成透明图，
+ *    任何阶段失败都会在报错里写明阶段、异常类型和详细信息——
+ *    之前的"抠图失败"两字是异常信息为空时的兜底，无法定位
+ * 2. 捕获范围扩大到系统级 Error（如内存不足），不再只捕获普通 Exception
+ * 3. 异常类型 + 信息拼进报错（XxxError: xxx），手机上直接可读
  */
 class MainActivity : FlutterActivity() {
 
@@ -43,30 +40,24 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL = "pet_segmentation/segment"
 
         /** 构建标识：首页底部可见，报错自动带上 */
-        private const val BUILD_TAG = "v1.1.1-hq"
+        private const val BUILD_TAG = "v1.1.2-hq"
 
-        /** 全量版模型（84MB）。轻量版 u2netp.tflite 可作低配备选（改此常量并重打包） */
+        /** 全量版模型（84MB） */
         private const val MODEL_FILE = "u2net.tflite"
         private const val MODEL_INPUT = 320
 
-        /** 模型候选路径，依次尝试（原生 assets 根目录 → Flutter 资源两种历史写法） */
+        /** 模型候选路径，依次尝试 */
         private val MODEL_CANDIDATES = listOf(
             MODEL_FILE,
             "flutter_assets/$MODEL_FILE",
             "flutter_assets/assets/models/$MODEL_FILE"
         )
 
-        /** 解码上限：1440 足够 2×2 贴片逼近原生细节，且给融合缓冲留足内存 */
         private const val DECODE_MAX_DIM = 1440
-
-        /** 最长边超过该值启用 2×2 贴片 */
         private const val TILE_THRESHOLD = 900
-
-        /** 归一化百分位（杀灰雾的关键） */
         private const val PERCENTILE_LO = 0.02f
         private const val PERCENTILE_HI = 0.98f
 
-        /** U2-Net 标准预处理：ImageNet mean/std 归一化 */
         private val MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)
     }
@@ -74,6 +65,18 @@ class MainActivity : FlutterActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
     private var interpreter: Interpreter? = null
+
+    /** 阶段包装：任何阶段抛错都会带上阶段名 + 异常类型 + 详细信息 */
+    private inline fun <T> stage(name: String, block: () -> T): T {
+        try {
+            return block()
+        } catch (t: Throwable) {
+            val detail = t.message?.takeIf { it.isNotBlank() } ?: "无更多信息"
+            throw RuntimeException(
+                "${name}失败 [${t.javaClass.simpleName}] $detail", t
+            )
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -109,25 +112,27 @@ class MainActivity : FlutterActivity() {
     private fun runSegmentation(path: String, maskSource: Int, result: MethodChannel.Result) {
         executor.execute {
             try {
-                val segmenter = obtainInterpreter()
-                val src = decodeScaled(path, DECODE_MAX_DIM)
+                val segmenter = stage("模型加载") { obtainInterpreter() }
+                val src = stage("读取图片") { decodeScaled(path, DECODE_MAX_DIM) }
 
                 // ---------- 贴片网格 ----------
                 val grid = if (max(src.width, src.height) > TILE_THRESHOLD) 2 else 1
                 val tileW0 = (src.width + grid - 1) / grid
                 val tileH0 = (src.height + grid - 1) / grid
-                // 重叠带：贴片尺寸的 12.5%，保证接缝处有渐变融合的空间
                 val pad = max(8, (min(tileW0, tileH0) * 0.125f).roundToInt())
 
-                // 一次分配输出缓冲（7 路形状固定，贴片间复用）
-                val outputs = HashMap<Int, Any>()
-                val buffers = Array(segmenter.outputTensorCount) { idx ->
-                    val count = segmenter.getOutputTensor(idx).shape()
-                        .fold(1) { acc, d -> acc * maxOf(d, 1) }
-                    ByteBuffer.allocateDirect(count * 4)
-                        .order(ByteOrder.nativeOrder())
-                        .also { outputs[idx] = it }
+                // ---------- 输出缓冲（7 路固定形状，贴片间复用） ----------
+                val outputs = stage("分配推理缓冲") {
+                    val map = HashMap<Int, Any>()
+                    Array(segmenter.outputTensorCount) { idx ->
+                        val count = segmenter.getOutputTensor(idx).shape()
+                            .fold(1) { acc, d -> acc * maxOf(d, 1) }
+                        ByteBuffer.allocateDirect(count * 4)
+                            .order(ByteOrder.nativeOrder())
+                            .also { map[idx] = it }
+                    }.also { map }
                 }
+                val buffers = outputs.first!!
                 val outIdx = maskSource.coerceIn(0, segmenter.outputTensorCount - 1)
 
                 // ---------- 逐贴片推理 + 加权融合 ----------
@@ -145,11 +150,16 @@ class MainActivity : FlutterActivity() {
                         val tw = x1 - x0
                         val th = y1 - y0
 
-                        val tile = Bitmap.createBitmap(src, x0, y0, tw, th)
-                        val mask320 = infer(segmenter, tile, outputs, outIdx)
-                        val tileAlpha = upscaleMask(mask320, tw, th)
+                        val tile = stage("切图($i,$j)") {
+                            Bitmap.createBitmap(src, x0, y0, tw, th)
+                        }
+                        val mask320 = stage("AI推理($i,$j)第${outIdx + 1}路") {
+                            infer(segmenter, tile, outputs, outIdx)
+                        }
+                        val tileAlpha = stage("遮罩放大($i,$j)") {
+                            upscaleMask(mask320, tw, th)
+                        }
 
-                        // 接缝羽化权重：重叠带内余弦渐变，图像边缘权重恒为 1
                         for (ty in 0 until th) {
                             val wy = edgeRamp(ty, th, pad, y0 == 0, y1 == h)
                             val rowA = (y0 + ty) * w
@@ -167,7 +177,7 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
-                // ---------- 后处理：百分位归一 → S 曲线 → 羽化 ----------
+                // ---------- 后处理 ----------
                 val alpha8 = FloatArray(w * h)
                 var filled = 0
                 for (i in alpha8.indices) {
@@ -184,38 +194,42 @@ class MainActivity : FlutterActivity() {
                 boxBlur3(alpha8, w, h, radius = 2)
 
                 // ---------- 合成透明 PNG ----------
-                val pixels = IntArray(w * h)
-                src.getPixels(pixels, 0, w, 0, 0, w, h)
-                val out = IntArray(w * h)
-                for (i in pixels.indices) {
-                    val a = alpha8[i].roundToInt().coerceIn(0, 255)
-                    val p = pixels[i]
-                    out[i] = if (a == 0) 0
-                    else Color.argb(a, Color.red(p), Color.green(p), Color.blue(p))
-                }
+                val outFile = stage("合成透明图") { composeAndSave(src, alpha8) }
                 src.recycle()
 
-                val resultBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                resultBmp.setPixels(out, 0, w, 0, 0, w, h)
-
-                val dir = getExternalFilesDir(null) ?: filesDir
-                val file = File(dir, "cutout_${System.currentTimeMillis()}.png")
-                FileOutputStream(file).use { fos ->
-                    resultBmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
-                }
-                resultBmp.recycle()
-
-                mainHandler.post { result.success(file.absolutePath) }
-            } catch (e: Exception) {
+                mainHandler.post { result.success(outFile.absolutePath) }
+            } catch (e: Throwable) {
                 mainHandler.post {
-                    result.error(
-                        "SEGMENT_FAIL",
-                        "[${BUILD_TAG}] ${e.message ?: "抠图失败"}",
-                        null
-                    )
+                    result.error("SEGMENT_FAIL", "[${BUILD_TAG}] ${e.message ?: "抠图失败"}", null)
                 }
             }
         }
+    }
+
+    /** 合成 alpha 并写盘（独立成函数便于阶段标注） */
+    private fun composeAndSave(src: Bitmap, alpha8: FloatArray): File {
+        val w = src.width
+        val h = src.height
+        val pixels = IntArray(w * h)
+        src.getPixels(pixels, 0, w, 0, 0, w, h)
+        val out = IntArray(w * h)
+        for (i in pixels.indices) {
+            val a = alpha8[i].roundToInt().coerceIn(0, 255)
+            val p = pixels[i]
+            out[i] = if (a == 0) 0
+            else Color.argb(a, Color.red(p), Color.green(p), Color.blue(p))
+        }
+
+        val resultBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        resultBmp.setPixels(out, 0, w, 0, 0, w, h)
+
+        val dir = getExternalFilesDir(null) ?: filesDir
+        val file = File(dir, "cutout_${System.currentTimeMillis()}.png")
+        FileOutputStream(file).use { fos ->
+            resultBmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
+        }
+        resultBmp.recycle()
+        return file
     }
 
     /** 单次推理：bitmap → 320² 输入 → 指定侧输出读出 320² 显著性 FloatArray */
@@ -251,10 +265,7 @@ class MainActivity : FlutterActivity() {
         return bp
     }
 
-    /**
-     * 距贴片边的羽化权重：落在重叠带内做余弦渐变（0→1），
-     * 贴片边紧贴图像边界的那一侧权重恒为 1（没有邻居需要融合）
-     */
+    /** 距贴片边的羽化权重：重叠带内余弦渐变（0→1），贴图像边界侧恒为 1 */
     private fun edgeRamp(pos: Int, len: Int, band: Int, edgeStart: Boolean, edgeEnd: Boolean): Float {
         val fromStart = if (edgeStart) 1f
         else if (pos >= band) 1f
@@ -271,10 +282,7 @@ class MainActivity : FlutterActivity() {
         return min(fromStart, fromEnd)
     }
 
-    /**
-     * 百分位归一化：只拉伸 2%~98% 分位之间的动态范围，
-     * 背景的微弱响应直接归零——地砖灰雾和阴影放大效应的主要来源
-     */
+    /** 百分位归一化：只拉伸 2%~98% 分位之间的动态范围 */
     private fun robustNormalize(data: FloatArray) {
         val hist = IntArray(256)
         for (v in data) hist[v.roundToInt().coerceIn(0, 255)]++
@@ -301,7 +309,7 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /** S 曲线（smoothstep）：主体核心推向不透明，边缘保留半透明过渡 */
+    /** S 曲线（smoothstep） */
     private fun sCurve(data: FloatArray) {
         for (i in data.indices) {
             val t = data[i] / 255f
@@ -309,11 +317,10 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /** 三次半径 2 的可分离盒模糊 ≈ 高斯羽化，软化锯齿边缘 */
+    /** 三次可分离盒模糊 ≈ 高斯羽化 */
     private fun boxBlur3(data: FloatArray, w: Int, h: Int, radius: Int) {
         val tmp = FloatArray(data.size)
         repeat(3) {
-            // 水平
             for (y in 0 until h) {
                 val row = y * w
                 var sum = 0f
@@ -329,7 +336,6 @@ class MainActivity : FlutterActivity() {
                     sum += data[row + inX] - data[row + outX]
                 }
             }
-            // 垂直
             for (x in 0 until w) {
                 var sum = 0f
                 var count = 0
@@ -347,7 +353,7 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /** 懒加载模型：原生 AssetManager 读取，候选路径依次尝试，只初始化一次 */
+    /** 懒加载模型：优先内存映射（零拷贝，内存占用减半），回退字节流读取，只初始化一次 */
     private fun obtainInterpreter(): Interpreter {
         synchronized(this) {
             interpreter?.let { return it }
@@ -370,18 +376,31 @@ class MainActivity : FlutterActivity() {
         val tried = StringBuilder()
         for (candidate in MODEL_CANDIDATES) {
             try {
-                val bytes = assets.open(candidate).use { it.readBytes() }
-                val buffer = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
-                buffer.put(bytes)
-                buffer.rewind()
-                return buffer
+                // 首选：mmap 零拷贝（资产未被压缩时可用，内存占用最低）
+                val afd = assets.openFd(candidate)
+                val mapped = afd.use {
+                    FileInputStream(it.fileDescriptor).channel.map(
+                        java.nio.channels.FileChannel.MapMode.READ_ONLY,
+                        it.startOffset,
+                        it.declaredLength
+                    )
+                }
+                return mapped
             } catch (_: Exception) {
-                tried.append(candidate).append("  ")
+                // 回退：字节流读取（资产被压缩时 openFd 不可用）
+                try {
+                    val bytes = assets.open(candidate).use { it.readBytes() }
+                    val buffer = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
+                    buffer.put(bytes)
+                    buffer.rewind()
+                    return buffer
+                } catch (_: Exception) {
+                    tried.append(candidate).append("  ")
+                }
             }
         }
         throw IllegalStateException(
-            "抠图模型没有打进 APK（尝试过：$tried）。" +
-                "修复方法：云端打包流程检测到模型缺失时会自动从源头下载，确认 workflow 正常运行即可。"
+            "模型不在 APK 里（尝试过：$tried）。确认云端打包时模型下载步骤正常。"
         )
     }
 
