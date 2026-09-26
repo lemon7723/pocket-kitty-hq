@@ -10,21 +10,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
+      # 下载全量版模型并做完整性校验（防止下载到错误页面 / 半截文件）
       - name: 确保抠图模型存在
         run: |
           mkdir -p android/app/src/main/assets
-          if [ ! -f "android/app/src/main/assets/u2net.tflite" ]; then
+          MODEL=android/app/src/main/assets/u2net.tflite
+          if [ ! -f "$MODEL" ]; then
             echo "u2net.tflite（全量版 84MB）缺失，自动下载补齐..."
-            curl -sL -o android/app/src/main/assets/u2net.tflite \
-              "https://huggingface.co/abhimanyu666/u2nettflite/resolve/main/u2net.tflite"
+            curl -sL --fail --retry 3 -o "$MODEL" \
+              "https://huggingface.co/abhimanyu666/u2nettflite/resolve/main/u2net.tflite" \
+              || { echo "下载失败"; exit 1; }
+          fi
+          SIZE=$(stat -c%s "$MODEL")
+          echo "模型大小: $SIZE 字节"
+          if [ "$SIZE" -lt 80000000 ]; then
+            echo "模型大小异常（应约 88063308 字节），可能下载到了错误页面"
+            exit 1
           fi
           echo "模型就位："
           ls -la android/app/src/main/assets/
 
       - name: 安装 Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -45,7 +54,7 @@ jobs:
         run: flutter build apk --release
 
       - name: 上传 APK 产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: pocket-kitty-apk
           path: build/app/outputs/flutter-apk/app-release.apk
