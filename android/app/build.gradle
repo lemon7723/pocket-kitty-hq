@@ -1,0 +1,52 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace = "com.pocketkitty.pocket_kitty"
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+
+    // 模型文件不压缩打包，保证运行时可直接读取
+    androidResources {
+        noCompress "tflite"
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+
+    defaultConfig {
+        applicationId = "com.pocketkitty.pocket_kitty"
+        // TFLite + image_picker 的最低兼容线
+        minSdk = 24
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.debug
+        }
+    }
+}
+
+flutter {
+    source = "../.."
+}
+
+dependencies {
+    // 完全离线抠图：TensorFlow Lite 运行时（无任何 Google 服务依赖）
+    implementation "org.tensorflow:tensorflow-lite:2.14.0"
+
+    // 读取照片 EXIF 方向
+    implementation "androidx.exifinterface:exifinterface:1.3.7"
+}

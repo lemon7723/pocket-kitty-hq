@@ -1,0 +1,26 @@
+name: pocket_kitty
+description: "口袋毛孩 1.0 真机测试版：拍照自动抠图，生成一比一数字宠物。"
+publish_to: 'none'
+version: 1.1.0+4
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  image_picker: ^1.1.2
+  audioplayers: ^6.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+  # 叫声音频：把 meow.mp3 放到 assets/sounds/ 后取消下面两行注释，再 flutter pub get
+  # 没有音频文件时 App 自动用系统提示音代替，不影响运行
+  # assets:
+  #   - assets/sounds/
