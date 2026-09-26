@@ -24,20 +24,18 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * 口袋毛孩 · Android 原生桥接（高画质终极版 v1.1.0）
+ * 口袋毛孩 · Android 原生桥接（高画质终极版 v1.1.1）
  *
  * 抠图引擎：TensorFlow Lite + U2-Net 全量版（84MB，320×320 输入，7 路侧输出）
  * - 完全离线，无 Google 服务依赖，华为无 GMS 手机直接运行
  *
+ * 【v1.1.1 修复】编译错误：cutout PNG 变量名统一为 file（v1.1.0 误引用 outfile）
  * 【v1.1.0 高画质管线】
  * 1. 全量版 U2-Net 替换轻量版（主体完整度、边缘判断显著提升）
  * 2. 贴片推理（2×2 带重叠滑窗）：有效分辨率翻倍，胡须/毛发以接近原生尺度进入模型
  * 3. 百分位归一化（2%~98%）替代 min-max 拉伸：杀掉背景灰雾与地砖阴影的放大效应
  * 4. S 曲线软阈值 + 三次盒模糊羽化：核心更实、边缘更透、过渡自然
  * 5. 7 路侧输出可通过 maskSource 参数实时切换对比（App 内 d1~d7 调试芯片）
- *
- * 关于 512/1024 直推：本 TFLite 转换产物输入形状已固化为 320×320，
- * 运行时改形状会直接崩溃；贴片推理在保持模型不变的前提下达成同等细节目标。
  */
 class MainActivity : FlutterActivity() {
 
@@ -47,7 +45,7 @@ class MainActivity : FlutterActivity() {
         /** 构建标识：首页底部可见，报错自动带上 */
         private const val BUILD_TAG = "v1.1.1-hq"
 
-        /** 全量版模型（84MB）。轻量版 u2netp.tflite 仍在 assets 里作低配备选 */
+        /** 全量版模型（84MB）。轻量版 u2netp.tflite 可作低配备选（改此常量并重打包） */
         private const val MODEL_FILE = "u2net.tflite"
         private const val MODEL_INPUT = 320
 
@@ -207,7 +205,7 @@ class MainActivity : FlutterActivity() {
                 }
                 resultBmp.recycle()
 
-                mainHandler.post { result.success(File.absolutePath) }
+                mainHandler.post { result.success(file.absolutePath) }
             } catch (e: Exception) {
                 mainHandler.post {
                     result.error(
