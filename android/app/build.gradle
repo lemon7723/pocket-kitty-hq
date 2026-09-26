@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.pocketkitty.pocket_kitty"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 35
     ndkVersion = flutter.ndkVersion
 
     // 模型文件不压缩打包，保证运行时可直接读取
@@ -27,7 +27,7 @@ android {
         applicationId = "com.pocketkitty.pocket_kitty"
         // TFLite + image_picker 的最低兼容线
         minSdk = 24
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
