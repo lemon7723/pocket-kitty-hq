@@ -45,7 +45,7 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL = "pet_segmentation/segment"
 
         /** 构建标识：首页底部可见，报错自动带上 */
-        private const val BUILD_TAG = "v1.1.0-hq"
+        private const val BUILD_TAG = "v1.1.1-hq"
 
         /** 全量版模型（84MB）。轻量版 u2netp.tflite 仍在 assets 里作低配备选 */
         private const val MODEL_FILE = "u2net.tflite"
@@ -207,7 +207,7 @@ class MainActivity : FlutterActivity() {
                 }
                 resultBmp.recycle()
 
-                mainHandler.post { result.success(outFile.absolutePath) }
+                mainHandler.post { result.success(File.absolutePath) }
             } catch (e: Exception) {
                 mainHandler.post {
                     result.error(
