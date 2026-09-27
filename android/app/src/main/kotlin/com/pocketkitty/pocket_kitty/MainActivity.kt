@@ -122,17 +122,17 @@ class MainActivity : FlutterActivity() {
                 val pad = max(8, (min(tileW0, tileH0) * 0.125f).roundToInt())
 
                 // ---------- 输出缓冲（7 路固定形状，贴片间复用） ----------
-                val outputs = stage("分配推理缓冲") {
-                    val map = HashMap<Int, Any>()
+                // outputs: TFLite 要求的 Map<Int, Any>；同时填充按下标取用的数组
+                val outputs = HashMap<Int, Any>()
+                stage("分配推理缓冲") {
                     Array(segmenter.outputTensorCount) { idx ->
                         val count = segmenter.getOutputTensor(idx).shape()
                             .fold(1) { acc, d -> acc * maxOf(d, 1) }
                         ByteBuffer.allocateDirect(count * 4)
                             .order(ByteOrder.nativeOrder())
-                            .also { map[idx] = it }
-                    }.also { map }
+                            .also { outputs[idx] = it }
+                    }
                 }
-                val buffers = outputs.first!!
                 val outIdx = maskSource.coerceIn(0, segmenter.outputTensorCount - 1)
 
                 // ---------- 逐贴片推理 + 加权融合 ----------
@@ -194,10 +194,10 @@ class MainActivity : FlutterActivity() {
                 boxBlur3(alpha8, w, h, radius = 2)
 
                 // ---------- 合成透明 PNG ----------
-                val outFile = stage("合成透明图") { composeAndSave(src, alpha8) }
+                val cutoutPng = stage("合成透明图") { composeAndSave(src, alpha8) }
                 src.recycle()
 
-                mainHandler.post { result.success(outFile.absolutePath) }
+                mainHandler.post { result.success(cutoutPng.absolutePath) }
             } catch (e: Throwable) {
                 mainHandler.post {
                     result.error("SEGMENT_FAIL", "[${BUILD_TAG}] ${e.message ?: "抠图失败"}", null)
