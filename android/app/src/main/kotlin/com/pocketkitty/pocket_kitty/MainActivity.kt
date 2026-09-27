@@ -171,17 +171,16 @@ class MainActivity : FlutterActivity() {
                         val rowA = (bbox.y0 + ty) * w
                         val rowR = ty * bbox.w
                         for (tx in 0 until bbox.w) {
-                            full[rowA + bbox.x0 + tx] = refinedUpscaled[rowR + tx]
+                            full[rowA + bbox.x0 + tx] = refinedUpscaled[rowR + tx].toFloat()
                         }
                     }
-                    refinedUpscaled.fill(0f) // 释放不再需要的中间数组引用
                     full
                 }
 
                 // ---- 后处理 ----
                 var filled = 0
                 for (v in alpha8) if (v > 127f) filled++
-                if (filled < w * h * 0.01f) {
+                if (filled < (w * h) * 0.01f) {
                     src.recycle()
                     throw IllegalStateException("没有识别到明确的主体，试试更清晰、宠物占比更大的照片")
                 }
