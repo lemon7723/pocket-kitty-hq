@@ -40,7 +40,7 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL = "pet_segmentation/segment"
 
         /** 构建标识：首页底部可见，报错自动带上 */
-        private const val BUILD_TAG = "v1.1.2-hq"
+        private const val BUILD_TAG = "v1.1.4-hq"
 
         /** 全量版模型（84MB） */
         private const val MODEL_FILE = "u2net.tflite"
@@ -54,7 +54,6 @@ class MainActivity : FlutterActivity() {
         )
 
         private const val DECODE_MAX_DIM = 1440
-        private const val TILE_THRESHOLD = 900
         private const val PERCENTILE_LO = 0.02f
         private const val PERCENTILE_HI = 0.98f
 
@@ -115,14 +114,7 @@ class MainActivity : FlutterActivity() {
                 val segmenter = stage("模型加载") { obtainInterpreter() }
                 val src = stage("读取图片") { decodeScaled(path, DECODE_MAX_DIM) }
 
-                // ---------- 贴片网格 ----------
-                val grid = if (max(src.width, src.height) > TILE_THRESHOLD) 2 else 1
-                val tileW0 = (src.width + grid - 1) / grid
-                val tileH0 = (src.height + grid - 1) / grid
-                val pad = max(8, (min(tileW0, tileH0) * 0.125f).roundToInt())
-
-                // ---------- 输出缓冲（7 路固定形状，贴片间复用） ----------
-                // outputs: TFLite 要求的 Map<Int, Any>；同时填充按下标取用的数组
+                // ---------- 输出缓冲（7 路固定形状，多次推理复用） ----------
                 val outputs = HashMap<Int, Any>()
                 stage("分配推理缓冲") {
                     Array(segmenter.outputTensorCount) { idx ->
@@ -135,55 +127,60 @@ class MainActivity : FlutterActivity() {
                 }
                 val outIdx = maskSource.coerceIn(0, segmenter.outputTensorCount - 1)
 
-                // ---------- 逐贴片推理 + 加权融合 ----------
                 val w = src.width
                 val h = src.height
-                val acc = FloatArray(w * h)
-                val wgt = FloatArray(w * h)
 
-                for (j in 0 until grid) {
-                    for (i in 0 until grid) {
-                        val x0 = max(0, i * tileW0 - pad)
-                        val y0 = max(0, j * tileH0 - pad)
-                        val x1 = min(w, (i + 1) * tileW0 + pad)
-                        val y1 = min(h, (j + 1) * tileH0 + pad)
-                        val tw = x1 - x0
-                        val th = y1 - y0
+                // ═══════════════════════════════════════════════
+                // 两段式推理（v1.1.4）：彻底取代贴片拼接
+                //
+                // 贴片方案的缺陷：各贴片独立推理，接缝处对主体边界的
+                // 判断不一致，融合后主体被拦腰截断（三段猫）。
+                //
+                // 两段式：
+                //   第①段：全图一次推理 → 粗遮罩（猫完整在画面内，
+                //           物理上不存在接缝）
+                //   第②段：粗遮罩定位主体包围盒（外扩 25% 余量），
+                //           把猫裁出来单独再推理一次 → 精修遮罩
+                //   猫占画面比例更大 = 进入模型的有效分辨率更高 =
+                //           胡须和毛发细节更好，且永远不可能被切开
+                // ═══════════════════════════════════════════════
 
-                        val tile = stage("切图($i,$j)") {
-                            Bitmap.createBitmap(src, x0, y0, tw, th)
-                        }
-                        val mask320 = stage("AI推理($i,$j)第${outIdx + 1}路") {
-                            infer(segmenter, tile, outputs, outIdx)
-                        }
-                        val tileAlpha = stage("遮罩放大($i,$j)") {
-                            upscaleMask(mask320, tw, th)
-                        }
+                // ---- 第①段：全图粗推理 ----
+                val coarseMask = stage("全图粗推理") {
+                    infer(segmenter, src, outputs, outIdx)
+                }
 
-                        for (ty in 0 until th) {
-                            val wy = edgeRamp(ty, th, pad, y0 == 0, y1 == h)
-                            val rowA = (y0 + ty) * w
-                            val rowT = ty * tw
-                            for (tx in 0 until tw) {
-                                val wx = edgeRamp(tx, tw, pad, x0 == 0, x1 == w)
-                                val weight = wx * wy
-                                if (weight <= 0f) continue
-                                val gi = rowA + x0 + tx
-                                acc[gi] += tileAlpha[rowT + tx] * weight
-                                wgt[gi] += weight
-                            }
+                // ---- 粗遮罩定位主体包围盒 ----
+                val bbox = stage("主体定位") {
+                    subjectBox(coarseMask, w, h, expandRatio = 0.25f)
+                }
+
+                // ---- 第②段：包围盒内精修推理 ----
+                val refined = stage("包围盒精修推理") {
+                    val crop = Bitmap.createBitmap(src, bbox.x0, bbox.y0, bbox.w, bbox.h)
+                    val refinedMask = infer(segmenter, crop, outputs, outIdx)
+                    crop.recycle()
+                    refinedMask
+                }
+
+                // ---- 精修遮罩贴回全图（包围盒外严格为 0） ----
+                val alpha8 = stage("遮罩合成") {
+                    val refinedUpscaled = upscaleMask(refined, bbox.w, bbox.h)
+                    val full = FloatArray(w * h)
+                    for (ty in 0 until bbox.h) {
+                        val rowA = (bbox.y0 + ty) * w
+                        val rowR = ty * bbox.w
+                        for (tx in 0 until bbox.w) {
+                            full[rowA + bbox.x0 + tx] = refinedUpscaled[rowR + tx]
                         }
-                        tile.recycle()
                     }
+                    refinedUpscaled.fill(0f) // 释放不再需要的中间数组引用
+                    full
                 }
 
-                // ---------- 后处理 ----------
-                val alpha8 = FloatArray(w * h)
+                // ---- 后处理 ----
                 var filled = 0
-                for (i in alpha8.indices) {
-                    alpha8[i] = if (wgt[i] > 0f) acc[i] / wgt[i] else 0f
-                    if (alpha8[i] > 127f) filled++
-                }
+                for (v in alpha8) if (v > 127f) filled++
                 if (filled < w * h * 0.01f) {
                     src.recycle()
                     throw IllegalStateException("没有识别到明确的主体，试试更清晰、宠物占比更大的照片")
@@ -205,6 +202,63 @@ class MainActivity : FlutterActivity() {
             }
         }
     }
+
+    /**
+     * 从 320² 粗遮罩中定位主体包围盒。
+     * 阈值取粗遮罩动态范围中点（抗背景噪声），
+     * 四周外扩 expandRatio 保证毛尖和胡须不被裁掉。
+     */
+    private fun subjectBox(
+        coarseMask: FloatArray,
+        w: Int,
+        h: Int,
+        expandRatio: Float
+    ): BoundingBox {
+        var mn = Float.MAX_VALUE
+        var mx = -Float.MAX_VALUE
+        for (v in coarseMask) {
+            if (v < mn) mn = v
+            if (v > mx) mx = v
+        }
+        val mid = (mn + mx) * 0.5f
+
+        var minX = Int.MAX_VALUE; var minY = Int.MAX_VALUE
+        var maxX = -1; var maxY = -1
+        for (y in 0 until MODEL_INPUT) {
+            val row = y * MODEL_INPUT
+            for (x in 0 until MODEL_INPUT) {
+                if (coarseMask[row + x] > mid) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        // 兜底：粗遮罩几乎无响应时，用全图当包围盒
+        if (maxX < 0) return BoundingBox(0, 0, w, h)
+
+        // 320 网格坐标 → 原图像素坐标
+        val sx = w.toFloat() / MODEL_INPUT
+        val sy = h.toFloat() / MODEL_INPUT
+        val px0 = (minX * sx).toInt()
+        val py0 = (minY * sy).toInt()
+        val px1 = ((maxX + 1) * sx).toInt().coerceAtMost(w)
+        val py1 = ((maxY + 1) * sy).toInt().coerceAtMost(h)
+
+        // 外扩余量并裁剪到图像边界
+        val ex = ((px1 - px0) * expandRatio).toInt()
+        val ey = ((py1 - py0) * expandRatio).toInt()
+        val x0 = (px0 - ex).coerceAtLeast(0)
+        val y0 = (py0 - ey).coerceAtLeast(0)
+        val x1 = (px1 + ex).coerceAtMost(w)
+        val y1 = (py1 + ey).coerceAtMost(h)
+
+        return BoundingBox(x0, y0, x1 - x0, y1 - y0)
+    }
+
+    private class BoundingBox(val x0: Int, val y0: Int, val w: Int, val h: Int)
+
 
     /** 合成 alpha 并写盘（独立成函数便于阶段标注） */
     private fun composeAndSave(src: Bitmap, alpha8: FloatArray): File {
@@ -265,24 +319,7 @@ class MainActivity : FlutterActivity() {
         return bp
     }
 
-    /** 距贴片边的羽化权重：重叠带内余弦渐变（0→1），贴图像边界侧恒为 1 */
-    private fun edgeRamp(pos: Int, len: Int, band: Int, edgeStart: Boolean, edgeEnd: Boolean): Float {
-        val fromStart = if (edgeStart) 1f
-        else if (pos >= band) 1f
-        else {
-            val t = pos.toFloat() / band
-            (1 - cos(t * Math.PI)).toFloat() * 0.5f
-        }
-        val fromEnd = if (edgeEnd) 1f
-        else if (pos < len - band) 1f
-        else {
-            val t = (len - 1 - pos).toFloat() / band
-            (1 - cos(t * Math.PI)).toFloat() * 0.5f
-        }
-        return min(fromStart, fromEnd)
-    }
-
-    /** 百分位归一化：只拉伸 2%~98% 分位之间的动态范围 */
+        /** 百分位归一化：只拉伸 2%~98% 分位之间的动态范围 */
     private fun robustNormalize(data: FloatArray) {
         val hist = IntArray(256)
         for (v in data) hist[v.roundToInt().coerceIn(0, 255)]++
